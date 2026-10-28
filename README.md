@@ -15,5 +15,5 @@ cargo build
 Check before every commit (each commit must pass on its own):
 
 ```sh
-cargo fmt --check && cargo clippy -- -D warnings && cargo build
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
