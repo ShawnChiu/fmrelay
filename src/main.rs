@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::future::poll_fn;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, ExitCode};
@@ -93,10 +94,17 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
         .ok()
         .filter(|u| u.scheme() == "file")
         .and_then(|u| u.to_file_path().ok());
-    if path.is_none() {
+    let Some(path) = path else {
         eprintln!("fmrelay: skipping {uri:?}: not a local file URI");
+        return None;
+    };
+    // `%00` decodes to a NUL byte, which no command line can hold; it would make the whole
+    // command fail, taking the other paths in it down too.
+    if path.as_os_str().as_bytes().contains(&0) {
+        eprintln!("fmrelay: skipping {uri:?}: NUL byte in the path");
+        return None;
     }
-    path
+    Some(path)
 }
 
 /// Fills `template` with `paths` and returns the commands to run.
@@ -420,5 +428,10 @@ mod tests {
         assert_eq!(uri_to_path("sftp://host/tmp/x"), None);
         assert_eq!(uri_to_path("file://otherhost/tmp/x"), None);
         assert_eq!(uri_to_path("not a uri"), None);
+    }
+
+    #[test]
+    fn uri_to_path_rejects_nul_bytes() {
+        assert_eq!(uri_to_path("file:///a%00b"), None);
     }
 }
