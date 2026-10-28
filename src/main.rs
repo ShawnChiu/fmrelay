@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::thread;
 
 use url::Url;
 use zbus::blocking::{connection, fdo::DBusProxy};
@@ -34,7 +35,8 @@ impl FileManager {
     fn handle(&self, method: &str, template: &[String], uris: Vec<String>, startup_id: String) {
         let paths: Vec<PathBuf> = uris.iter().filter_map(|u| uri_to_path(u)).collect();
         for argv in expand(template, &paths) {
-            eprintln!("{method}: would run {argv:?} startup_id={startup_id:?}");
+            eprintln!("{method}: running {argv:?} startup_id={startup_id:?}");
+            launch(argv, &startup_id);
         }
     }
 }
@@ -51,6 +53,34 @@ impl FileManager {
 
     fn show_item_properties(&self, uris: Vec<String>, startup_id: String) {
         self.handle("ShowItemProperties", &self.properties, uris, startup_id);
+    }
+}
+
+/// Starts `argv` without waiting for it, passing on the caller's activation token so the
+/// compositor focuses the new window.
+fn launch(argv: Vec<OsString>, startup_id: &str) {
+    let Some((program, args)) = argv.split_first() else {
+        return;
+    };
+    let mut command = Command::new(program);
+    command.args(args);
+    for var in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
+        // A token we inherited has already been used or has expired; don't pass it on.
+        match startup_id {
+            "" => command.env_remove(var),
+            _ => command.env(var, startup_id),
+        };
+    }
+    match command.spawn() {
+        // Reap the child in the background so the method can return right away.
+        Ok(mut child) => {
+            thread::spawn(move || match child.wait() {
+                Ok(status) if !status.success() => eprintln!("fmrelay: {argv:?} {status}"),
+                Ok(_) => {}
+                Err(e) => eprintln!("fmrelay: waiting for {argv:?}: {e}"),
+            });
+        }
+        Err(e) => eprintln!("fmrelay: cannot run {argv:?}: {e}"),
     }
 }
 
