@@ -1,0 +1,6 @@
+# Install to ~/.local/share/dbus-1/services/ so a call starts fmrelay.service instead of
+# the system file manager; files there take precedence over /usr/share/dbus-1/services/.
+[D-BUS Service]
+Name=org.freedesktop.FileManager1
+Exec=/bin/false
+SystemdService=fmrelay.service
