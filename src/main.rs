@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use url::Url;
@@ -33,7 +33,9 @@ struct FileManager {
 impl FileManager {
     fn handle(&self, method: &str, template: &[String], uris: Vec<String>, startup_id: String) {
         let paths: Vec<PathBuf> = uris.iter().filter_map(|u| uri_to_path(u)).collect();
-        eprintln!("{method} {template:?} {paths:?} startup_id={startup_id:?}");
+        for argv in expand(template, &paths) {
+            eprintln!("{method}: would run {argv:?} startup_id={startup_id:?}");
+        }
     }
 }
 
@@ -62,6 +64,70 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
         eprintln!("fmrelay: skipping {uri:?}: not a local file URI");
     }
     path
+}
+
+/// Fills `template` with `paths` and returns the commands to run.
+///
+/// An argument that is exactly `{}` or `{parent}` becomes every path (or every distinct
+/// parent) and the command runs once. A placeholder inside a longer argument, such as
+/// `--select={}`, can only hold one path, so the command runs once per path instead.
+fn expand(template: &[String], paths: &[PathBuf]) -> Vec<Vec<OsString>> {
+    let per_path = template.iter().any(|arg| {
+        (arg.contains("{}") || arg.contains("{parent}")) && arg != "{}" && arg != "{parent}"
+    });
+    let groups: Vec<&[PathBuf]> = match (paths.is_empty(), per_path) {
+        (true, _) => Vec::new(),
+        (false, true) => paths.chunks(1).collect(),
+        (false, false) => vec![paths],
+    };
+
+    let mut commands = Vec::new();
+    for group in groups {
+        let mut parents: Vec<&Path> = Vec::new();
+        for path in group {
+            if !parents.contains(&parent(path)) {
+                parents.push(parent(path));
+            }
+        }
+        let mut argv = Vec::new();
+        for arg in template {
+            match arg.as_str() {
+                "{}" => argv.extend(group.iter().map(|p| p.as_os_str().to_owned())),
+                "{parent}" => argv.extend(parents.iter().map(|p| p.as_os_str().to_owned())),
+                _ => argv.push(substitute(arg, &group[0])),
+            }
+        }
+        // Several items in one folder give the same {parent} command; open it once.
+        if !commands.contains(&argv) {
+            commands.push(argv);
+        }
+    }
+    commands
+}
+
+/// The folder holding `path`; the root is its own parent.
+fn parent(path: &Path) -> &Path {
+    path.parent().unwrap_or(path)
+}
+
+/// Replaces every `{}` and `{parent}` inside `arg`, keeping non-UTF-8 paths intact.
+fn substitute(arg: &str, path: &Path) -> OsString {
+    let mut out = OsString::new();
+    let mut rest = arg;
+    loop {
+        let next = [("{}", path), ("{parent}", parent(path))]
+            .into_iter()
+            .filter_map(|(placeholder, value)| Some((rest.find(placeholder)?, placeholder, value)))
+            .min_by_key(|&(i, ..)| i);
+        let Some((i, placeholder, value)) = next else {
+            break;
+        };
+        out.push(&rest[..i]);
+        out.push(value);
+        rest = &rest[i + placeholder.len()..];
+    }
+    out.push(rest);
+    out
 }
 
 /// Parses the arguments after the program name; `Ok(None)` means `--help`.
@@ -173,6 +239,76 @@ mod tests {
 
     fn strings(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn paths(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    fn commands(commands: &[&[&str]]) -> Vec<Vec<OsString>> {
+        commands.iter().map(|c| args(c)).collect()
+    }
+
+    #[test]
+    fn expand_whole_argument_takes_all_paths_in_one_command() {
+        let got = expand(&strings(&["yazi", "{}"]), &paths(&["/a/x", "/b/y"]));
+        assert_eq!(got, commands(&[&["yazi", "/a/x", "/b/y"]]));
+    }
+
+    #[test]
+    fn expand_embedded_placeholder_runs_once_per_path() {
+        let got = expand(
+            &strings(&["ranger", "--selectfile={}"]),
+            &paths(&["/a/x", "/b/y"]),
+        );
+        let want = commands(&[
+            &["ranger", "--selectfile=/a/x"],
+            &["ranger", "--selectfile=/b/y"],
+        ]);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn expand_dedups_parents() {
+        let files = paths(&["/a/x", "/a/y", "/b/z"]);
+        let got = expand(&strings(&["thunar", "{parent}"]), &files);
+        assert_eq!(got, commands(&[&["thunar", "/a", "/b"]]));
+
+        let got = expand(&strings(&["fm", "--dir={parent}"]), &files);
+        assert_eq!(got, commands(&[&["fm", "--dir=/a"], &["fm", "--dir=/b"]]));
+    }
+
+    #[test]
+    fn expand_substitutes_every_placeholder_in_an_argument() {
+        let got = expand(&strings(&["fm", "{parent}:{}:{}"]), &paths(&["/a/x"]));
+        assert_eq!(got, commands(&[&["fm", "/a:/a/x:/a/x"]]));
+    }
+
+    #[test]
+    fn expand_keeps_each_path_one_argument() {
+        let files = paths(&["/tmp/a b", "-rf"]);
+        let got = expand(&strings(&["fm", "--", "{}"]), &files);
+        assert_eq!(got, commands(&[&["fm", "--", "/tmp/a b", "-rf"]]));
+    }
+
+    #[test]
+    fn expand_root_is_its_own_parent() {
+        let got = expand(&strings(&["fm", "{parent}"]), &paths(&["/"]));
+        assert_eq!(got, commands(&[&["fm", "/"]]));
+    }
+
+    #[test]
+    fn expand_keeps_non_utf8_paths() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"/a/\xff"));
+        let got = expand(&strings(&["fm", "--select={}"]), &[path]);
+        assert_eq!(got[0][1].as_bytes(), b"--select=/a/\xff");
+    }
+
+    #[test]
+    fn expand_nothing_without_paths() {
+        assert!(expand(&strings(&["fm", "{}"]), &[]).is_empty());
     }
 
     #[test]
