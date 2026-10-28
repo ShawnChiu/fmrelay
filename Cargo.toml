@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+lexopt = "0.3.2"
+shlex = "2.0.1"
 url = "2.5.8"
 zbus = "5"

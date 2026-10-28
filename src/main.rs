@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -10,27 +11,44 @@ use zbus::names::BusName;
 const NAME: &str = "org.freedesktop.FileManager1";
 const PATH: &str = "/org/freedesktop/FileManager1";
 
-struct FileManager;
+const USAGE: &str = "\
+usage: fmrelay --folders CMD [--items CMD] [--properties CMD]
+
+Serve org.freedesktop.FileManager1 and run CMD for each request. CMD is split
+like a shell command line (no shell is run) and must contain {} (the path) or
+{parent} (its parent folder).
+
+  --folders CMD     for ShowFolders
+  --items CMD       for ShowItems (default: --folders)
+  --properties CMD  for ShowItemProperties (default: --items)";
+
+/// One command template per method, already split into arguments.
+#[derive(Debug, PartialEq)]
+struct FileManager {
+    folders: Vec<String>,
+    items: Vec<String>,
+    properties: Vec<String>,
+}
 
 impl FileManager {
-    fn handle(&self, method: &str, uris: Vec<String>, startup_id: String) {
+    fn handle(&self, method: &str, template: &[String], uris: Vec<String>, startup_id: String) {
         let paths: Vec<PathBuf> = uris.iter().filter_map(|u| uri_to_path(u)).collect();
-        eprintln!("{method} {paths:?} startup_id={startup_id:?}");
+        eprintln!("{method} {template:?} {paths:?} startup_id={startup_id:?}");
     }
 }
 
 #[interface(name = "org.freedesktop.FileManager1")]
 impl FileManager {
     fn show_folders(&self, uris: Vec<String>, startup_id: String) {
-        self.handle("ShowFolders", uris, startup_id);
+        self.handle("ShowFolders", &self.folders, uris, startup_id);
     }
 
     fn show_items(&self, uris: Vec<String>, startup_id: String) {
-        self.handle("ShowItems", uris, startup_id);
+        self.handle("ShowItems", &self.items, uris, startup_id);
     }
 
     fn show_item_properties(&self, uris: Vec<String>, startup_id: String) {
-        self.handle("ShowItemProperties", uris, startup_id);
+        self.handle("ShowItemProperties", &self.properties, uris, startup_id);
     }
 }
 
@@ -46,8 +64,64 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     path
 }
 
+/// Parses the arguments after the program name; `Ok(None)` means `--help`.
+fn parse_args(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<Option<FileManager>, lexopt::Error> {
+    use lexopt::prelude::*;
+
+    let mut parser = lexopt::Parser::from_args(args);
+    let (mut folders, mut items, mut properties) = (None, None, None);
+    while let Some(arg) = parser.next()? {
+        let (option, slot) = match arg {
+            Long("folders") => ("--folders", &mut folders),
+            Long("items") => ("--items", &mut items),
+            Long("properties") => ("--properties", &mut properties),
+            Short('h') | Long("help") => return Ok(None),
+            _ => return Err(arg.unexpected()),
+        };
+        let command = parser.value()?.string()?;
+        *slot = Some(parse_template(option, &command)?);
+    }
+
+    let folders = folders.ok_or("missing required option --folders")?;
+    let items = items.unwrap_or_else(|| folders.clone());
+    let properties = properties.unwrap_or_else(|| items.clone());
+    Ok(Some(FileManager {
+        folders,
+        items,
+        properties,
+    }))
+}
+
+/// Splits `command` into arguments and makes sure it has somewhere to put the paths.
+fn parse_template(option: &str, command: &str) -> Result<Vec<String>, String> {
+    let template = shlex::split(command)
+        .ok_or_else(|| format!("{option}: unbalanced quotes in {command:?}"))?;
+    // Appending the paths silently would guess wrong for commands that want them elsewhere.
+    if !template
+        .iter()
+        .any(|arg| arg.contains("{}") || arg.contains("{parent}"))
+    {
+        return Err(format!("{option}: no {{}} or {{parent}} in {command:?}"));
+    }
+    Ok(template)
+}
+
 fn main() -> ExitCode {
-    match run() {
+    let fm = match parse_args(std::env::args_os().skip(1)) {
+        Ok(Some(fm)) => fm,
+        Ok(None) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("fmrelay: {e}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match run(fm) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("fmrelay: {e}");
@@ -56,10 +130,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> zbus::Result<ExitCode> {
+fn run(fm: FileManager) -> zbus::Result<ExitCode> {
     // Serve the object before taking the name so no call arrives unhandled.
     let conn = connection::Builder::session()?
-        .serve_at(PATH, FileManager)?
+        .serve_at(PATH, fm)?
         .build()?;
 
     let dbus = DBusProxy::new(&conn)?;
@@ -92,6 +166,61 @@ fn run() -> zbus::Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_args_defaults_items_to_folders_and_properties_to_items() {
+        let fm = parse_args(args(&["--folders", "yazi {}"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fm.items, strings(&["yazi", "{}"]));
+        assert_eq!(fm.properties, strings(&["yazi", "{}"]));
+
+        let fm = parse_args(args(&["--folders=a {}", "--items", "b {parent}"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fm.folders, strings(&["a", "{}"]));
+        assert_eq!(fm.items, strings(&["b", "{parent}"]));
+        assert_eq!(fm.properties, strings(&["b", "{parent}"]));
+    }
+
+    #[test]
+    fn parse_args_splits_like_a_shell() {
+        let fm = parse_args(args(&["--folders", "ghostty -e 'my fm' --select={}"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fm.folders,
+            strings(&["ghostty", "-e", "my fm", "--select={}"])
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_bad_input() {
+        for bad in [
+            &["--folders", "echo"][..],
+            &["--folders", ""],
+            &["--folders", "echo '{}"],
+            &["--folders", "echo {}", "--items", "echo"],
+            &["--items", "echo {}"],
+            &["--folders", "echo {}", "extra"],
+            &["--folders"],
+        ] {
+            assert!(parse_args(args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn parse_args_help() {
+        assert_eq!(parse_args(args(&["--help"])).unwrap(), None);
+    }
 
     #[test]
     fn uri_to_path_decodes_percent_encoding() {
