@@ -2,7 +2,11 @@
 name = "fmrelay"
 version = "0.1.0"
 edition = "2024"
+description = "org.freedesktop.FileManager1 for any file manager: route \"Show in folder\" to a command"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/ShawnChiu/fmrelay"
+keywords = ["dbus", "file-manager", "freedesktop", "wayland"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 lexopt = "0.3.2"
