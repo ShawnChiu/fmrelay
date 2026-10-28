@@ -16,6 +16,9 @@ use zbus::names::BusName;
 const NAME: &str = "org.freedesktop.FileManager1";
 const PATH: &str = "/org/freedesktop/FileManager1";
 
+/// The most commands one call may start.
+const MAX_COMMANDS: usize = 16;
+
 const USAGE: &str = "\
 usage: fmrelay --folders CMD [--items CMD] [--properties CMD]
 
@@ -38,7 +41,15 @@ struct FileManager {
 impl FileManager {
     fn handle(&self, method: &str, template: &[String], uris: Vec<String>, startup_id: String) {
         let paths: Vec<PathBuf> = uris.iter().filter_map(|u| uri_to_path(u)).collect();
-        for argv in expand(template, &paths) {
+        let commands = expand(template, &paths);
+        // A per-path template turns a call with many URIs into as many processes.
+        if commands.len() > MAX_COMMANDS {
+            eprintln!(
+                "{method}: running the first {MAX_COMMANDS} of {} commands",
+                commands.len()
+            );
+        }
+        for argv in commands.into_iter().take(MAX_COMMANDS) {
             eprintln!("{method}: running {argv:?} startup_id={startup_id:?}");
             launch(argv, &startup_id);
         }

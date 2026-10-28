@@ -87,7 +87,8 @@ How a placeholder is expanded depends on where it is:
 - An argument that is **exactly** `{}` or `{parent}` becomes every path, and the command
   runs once: `nautilus --select {}` → `nautilus --select /a/x /b/y`.
 - A placeholder **inside** a longer argument holds one path, so the command runs once per
-  path: `fm --select={}` → `fm --select=/a/x`, then `fm --select=/b/y`.
+  path: `fm --select={}` → `fm --select=/a/x`, then `fm --select=/b/y`. A single call starts
+  at most 16 commands; the rest are logged and skipped.
 
 ## Examples
 
