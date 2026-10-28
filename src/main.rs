@@ -1,11 +1,14 @@
 use std::ffi::OsString;
+use std::future::poll_fn;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, ExitCode};
 use std::thread;
 
 use url::Url;
-use zbus::blocking::{connection, fdo::DBusProxy};
-use zbus::fdo::{RequestNameFlags, RequestNameReply};
+use zbus::connection;
+use zbus::export::futures_core::Stream;
+use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
 use zbus::interface;
 use zbus::names::BusName;
 
@@ -227,30 +230,37 @@ fn main() -> ExitCode {
 }
 
 fn run(fm: FileManager) -> zbus::Result<ExitCode> {
-    // Serve the object before taking the name so no call arrives unhandled.
-    let conn = connection::Builder::session()?
-        .serve_at(PATH, fm)?
-        .build()?;
+    // The connection only makes progress while this thread is inside block_on.
+    zbus::block_on(serve(fm))
+}
 
-    let dbus = DBusProxy::new(&conn)?;
-    let acquired = dbus.receive_name_acquired()?;
+async fn serve(fm: FileManager) -> zbus::Result<ExitCode> {
+    // Serve the object before taking the name so no call arrives unhandled.
+    let conn = connection::Builder::session()
+        .serve_at(PATH, fm)
+        .build()
+        .await?;
+
+    let dbus = DBusProxy::new(&conn).await?;
+    let mut acquired = dbus.receive_name_acquired().await?;
 
     // No AllowReplacement: a file manager started later must not take the name back.
     // No DoNotQueue: Nautilus doesn't allow replacement either, so if it got there first
     // we wait in the bus queue and take over when it exits.
-    let flags = RequestNameFlags::ReplaceExisting.into();
-    match conn.request_name_with_flags(NAME, flags)? {
+    let flags = RequestNameFlags::REPLACE_EXISTING;
+    match conn.request_name_with_flags(NAME, flags).await? {
         RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner => {}
         RequestNameReply::InQueue | RequestNameReply::Exists => {
             let owner = dbus
                 .get_name_owner(BusName::try_from(NAME)?)
+                .await
                 .map(|o| o.to_string())
                 .unwrap_or_else(|e| format!("unknown ({e})"));
             eprintln!("fmrelay: {NAME} is owned by {owner}, waiting in queue");
         }
     }
 
-    for signal in acquired {
+    while let Some(signal) = poll_fn(|cx| Pin::new(&mut acquired).poll_next(cx)).await {
         if signal.args()?.name == NAME {
             eprintln!("fmrelay: serving {NAME}");
         }

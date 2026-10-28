@@ -12,4 +12,4 @@ categories = ["command-line-utilities"]
 lexopt = "0.3.2"
 shlex = "2.0.1"
 url = "2.5.8"
-zbus = "5"
+zbus = "6"
